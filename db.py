@@ -20,7 +20,7 @@ logs_col = db["logs"]
 # WARNINGS
 def get_warn_count(chat_id, user_id):
     doc = warnings_col.find_one({"chat_id": int(chat_id), "user_id": int(user_id)})
-    return doc["count"] if doc else 0
+    return int(doc["count"]) if doc and "count" in doc else 0
 
 def set_warn_count(chat_id, user_id, count):
     warnings_col.update_one(
@@ -45,7 +45,7 @@ def remove_filter(chat_id, word):
 
 def get_filters(chat_id):
     docs = filters_col.find({"chat_id": int(chat_id)})
-    return [d["word"] for d in docs]
+    return [d["word"] for d in docs] if docs else []
 
 # SETTINGS
 def get_setting(chat_id, key, default=None):
