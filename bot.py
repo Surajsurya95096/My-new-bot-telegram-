@@ -7,7 +7,7 @@ from functools import wraps
 from dotenv import load_dotenv
 
 from telegram import (
-    Update, InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions, ChatMember, MessageEntity
+    Update, InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions, ChatMember
 )
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes,
@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 # Moderation constants
 URL_REGEX = re.compile(r"(https?://\S+|\bwww\.\S+)", re.IGNORECASE)
-DEFAULT_BADWORDS = ["spamword1","scam","porn","sex","casino","fake"]
+DEFAULT_BADWORDS = ["spamword1", "scam", "porn", "sex", "casino", "fake"]
 
 # In-memory flood tracker (for production use Redis)
 _flood_cache = {}  # {(chat_id,user_id): [timestamps]}
@@ -51,7 +51,8 @@ def check_flood(chat_id, user_id, limit):
     key = (int(chat_id), int(user_id))
     now = time.time()
     hits = _flood_cache.get(key, [])
-    hits = [t for t in hits if now - t < 7]  # 7s window
+    # keep only hits in last 7 seconds window
+    hits = [t for t in hits if now - t < 7]
     hits.append(now)
     _flood_cache[key] = hits
     return len(hits) > limit
@@ -64,11 +65,10 @@ def admin_only(func):
         if user and (user.id in ADMIN_IDS):
             return await func(update, context)
         else:
-            # Some handlers (callback query) may not have message
             try:
                 if update.effective_message:
                     await update.effective_message.reply_text("❌ You are not authorized for this command.")
-            except:
+            except Exception:
                 pass
             return
     return wrapper
@@ -94,12 +94,11 @@ async def chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     result = update.chat_member
     old = result.old_chat_member
     new = result.new_chat_member
-    # Detect join (left -> member)
     try:
         if old.status in (ChatMember.LEFT, ChatMember.KICKED) and new.status == ChatMember.MEMBER:
             user = result.new_chat_member.user
             chat = update.chat_member.chat
-            # restrict temporarily
+            # restrict temporarily (prevent sending messages until verify)
             try:
                 await context.bot.restrict_chat_member(
                     chat_id=chat.id,
@@ -110,7 +109,6 @@ async def chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 logger.warning(f"Could not restrict new member: {e}")
             keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ I'm human", callback_data=f"captcha:{user.id}")]])
             await context.bot.send_message(chat_id=chat.id, text=f"{WELCOME_TEXT}\nPlease verify within {CAPTCHA_TIMEOUT}s.", reply_markup=keyboard)
-            # log
             log_action(chat.id, user.id, "join_restriction", "captcha_sent")
     except Exception as e:
         logger.exception("chat_member_handler error")
@@ -121,7 +119,11 @@ async def captcha_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data or ""
     if data.startswith("captcha:"):
-        expected_id = int(data.split(":",1)[1])
+        try:
+            expected_id = int(data.split(":", 1)[1])
+        except Exception:
+            await query.edit_message_text("❌ Invalid verification data.")
+            return
         user = query.from_user
         if user.id != expected_id:
             await query.edit_message_text("❌ This verification is not for you.")
@@ -129,34 +131,51 @@ async def captcha_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = query.message.chat.id
         # lift restrictions
         try:
-            await context.bot.restrict_chat_member(chat_id=chat_id, user_id=user.id,
-                                                   permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True,
-                                                                               can_add_web_page_previews=True, can_send_other_messages=True))
+            await context.bot.restrict_chat_member(
+                chat_id=chat_id,
+                user_id=user.id,
+                permissions=ChatPermissions(
+                    can_send_messages=True,
+                    can_send_media_messages=True,
+                    can_add_web_page_previews=True,
+                    can_send_other_messages=True
+                )
+            )
             await query.edit_message_text("✅ Verified — welcome!")
             log_action(chat_id, user.id, "verified", "captcha")
         except Exception as e:
             logger.exception("Could not lift restrictions after captcha")
 
 # Warn helper
-async def warn_user(context: ContextTypes.DEFAULT_TYPE, chat_id:int, user_id:int, reason:str=""):
-    count = get_warn_count(chat_id, user_id) + 1
-    set_warn_count(chat_id, user_id, count)
+async def warn_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, reason: str = ""):
+    try:
+        current = get_warn_count(chat_id, user_id) or 0
+    except Exception:
+        current = 0
+    count = current + 1
+    try:
+        set_warn_count(chat_id, user_id, count)
+    except Exception:
+        logger.exception("Failed to set warn count")
     try:
         await context.bot.send_message(chat_id=chat_id, text=f"⚠️ <a href='tg://user?id={user_id}'>User</a> warned ({count}/{WARN_LIMIT}). Reason: {reason}", parse_mode="HTML")
-    except:
+    except Exception:
         pass
     log_action(chat_id, user_id, "warn", reason)
     if count >= WARN_LIMIT:
-        # mute for 1 hour
+        # mute for 1 hour then reset warns
         try:
             await context.bot.restrict_chat_member(chat_id=chat_id, user_id=user_id,
                                                    permissions=ChatPermissions(can_send_messages=False),
                                                    until_date=int(time.time()) + 3600)
             await context.bot.send_message(chat_id=chat_id, text=f"🔇 User muted for 1 hour due to repeated warnings.")
             log_action(chat_id, user_id, "mute", "warn_limit_reached")
-        except Exception as e:
+        except Exception:
             logger.exception("Could not mute user.")
-        reset_warn(chat_id, user_id)
+        try:
+            reset_warn(chat_id, user_id)
+        except Exception:
+            logger.exception("Could not reset warns after mute")
 
 # Message moderation filter
 async def message_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -168,17 +187,45 @@ async def message_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user and user.is_bot:
         return
 
-    antispam = get_setting(chat_id, "antispam", 1) or 0
-    block_links = get_setting(chat_id, "block_links", 1) or 0
-    flood_limit = int(get_setting(chat_id, "flood_limit", F L O O D _ L I M I T)) if get_setting(chat_id, "flood_limit") is not None else F L O O D _ L I M I T
+    # keep original text for caps check, lower-case for matching
+    raw_text = (msg.text or msg.caption or "") 
+    text = raw_text.lower()
 
-    text = (msg.text or msg.caption or "").lower()
+    # Fetch settings with safe fallbacks
+    try:
+        antispam_setting = get_setting(chat_id, "antispam", None)
+    except Exception:
+        antispam_setting = None
+    try:
+        block_links_setting = get_setting(chat_id, "block_links", None)
+    except Exception:
+        block_links_setting = None
+    try:
+        flood_setting = get_setting(chat_id, "flood_limit", None)
+    except Exception:
+        flood_setting = None
+
+    try:
+        antispam = int(antispam_setting) if antispam_setting is not None else 1
+    except Exception:
+        antispam = 1
+    try:
+        block_links = int(block_links_setting) if block_links_setting is not None else 1
+    except Exception:
+        block_links = 1
+    if flood_setting is None:
+        flood_limit = FLOOD_LIMIT
+    else:
+        try:
+            flood_limit = int(flood_setting)
+        except Exception:
+            flood_limit = FLOOD_LIMIT
 
     # flood
     if check_flood(chat_id, user.id, flood_limit):
         try:
             await msg.delete()
-        except:
+        except Exception:
             pass
         log_action(chat_id, user.id, "deleted", "flood")
         await warn_user(context, chat_id, user.id, reason="Flooding")
@@ -189,29 +236,34 @@ async def message_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user.id not in ADMIN_IDS:
             try:
                 await msg.delete()
-            except:
+            except Exception:
                 pass
             log_action(chat_id, user.id, "deleted", "link")
             await warn_user(context, chat_id, user.id, reason="Posting links")
             return
 
     # bad words
-    filters = get_filters(chat_id) or DEFAULT_BADWORDS
-    for w in filters:
+    try:
+        filters_list = get_filters(chat_id) or []
+    except Exception:
+        filters_list = []
+    if not filters_list:
+        filters_list = DEFAULT_BADWORDS
+    for w in filters_list:
         if w and w in text:
             try:
                 await msg.delete()
-            except:
+            except Exception:
                 pass
             log_action(chat_id, user.id, "deleted", f"badword:{w}")
             await warn_user(context, chat_id, user.id, reason=f"Use of banned word: {w}")
             return
 
-    # caps spam heuristic
-    if text and sum(1 for c in text if c.isupper()) > 25 and len(text) < 400:
+    # caps spam heuristic (use raw_text so uppercase check works)
+    if raw_text and sum(1 for c in raw_text if c.isupper()) > 25 and len(raw_text) < 400:
         try:
             await msg.delete()
-        except:
+        except Exception:
             pass
         log_action(chat_id, user.id, "deleted", "caps spam")
         await warn_user(context, chat_id, user.id, reason="Caps spam")
@@ -225,8 +277,12 @@ async def addfilter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("Usage: /addfilter <word>")
         return
     word = " ".join(context.args).strip().lower()
-    add_filter(chat_id, word)
-    await update.effective_message.reply_text(f"Added filter: {word}")
+    try:
+        add_filter(chat_id, word)
+        await update.effective_message.reply_text(f"Added filter: {word}")
+    except Exception:
+        logger.exception("Failed to add filter")
+        await update.effective_message.reply_text("Failed to add filter due to internal error.")
 
 @admin_only
 async def delfilter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -235,13 +291,20 @@ async def delfilter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("Usage: /delfilter <word>")
         return
     word = " ".join(context.args).strip().lower()
-    remove_filter(chat_id, word)
-    await update.effective_message.reply_text(f"Removed filter: {word}")
+    try:
+        remove_filter(chat_id, word)
+        await update.effective_message.reply_text(f"Removed filter: {word}")
+    except Exception:
+        logger.exception("Failed to remove filter")
+        await update.effective_message.reply_text("Failed to remove filter due to internal error.")
 
 @admin_only
 async def listfilters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    words = get_filters(chat_id)
+    try:
+        words = get_filters(chat_id)
+    except Exception:
+        words = []
     if not words:
         await update.effective_message.reply_text("No filters set.")
     else:
@@ -250,7 +313,6 @@ async def listfilters_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def warn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    # support reply or /warn <user_id> <reason>
     if update.message.reply_to_message:
         target = update.message.reply_to_message.from_user.id
         reason = " ".join(context.args) if context.args else ""
@@ -258,7 +320,7 @@ async def warn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             target = int(context.args[0])
             reason = " ".join(context.args[1:]) if len(context.args) > 1 else ""
-        except:
+        except Exception:
             await update.effective_message.reply_text("Usage: reply to user or /warn <user_id> <reason>")
             return
     else:
@@ -274,14 +336,18 @@ async def unwarn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif context.args:
         try:
             target = int(context.args[0])
-        except:
+        except Exception:
             await update.effective_message.reply_text("Could not parse user id.")
             return
     else:
         await update.effective_message.reply_text("Usage: reply to user or /unwarn <user_id>")
         return
-    reset_warn(chat_id, target)
-    await update.effective_message.reply_text("Warnings reset.")
+    try:
+        reset_warn(chat_id, target)
+        await update.effective_message.reply_text("Warnings reset.")
+    except Exception:
+        logger.exception("Failed to reset warns")
+        await update.effective_message.reply_text("Failed to reset warns due to internal error.")
 
 @admin_only
 async def set_warn_limit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -292,7 +358,7 @@ async def set_warn_limit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         WARN_LIMIT = int(context.args[0])
         await update.effective_message.reply_text(f"Global warn limit set to {WARN_LIMIT}")
-    except:
+    except Exception:
         await update.effective_message.reply_text("Invalid number.")
 
 # Build and run application
@@ -318,7 +384,6 @@ def main():
 
     if USE_WEBHOOK and WEBHOOK_URL:
         logger.info("Webhook mode requested but webhook setup not implemented in this snippet.")
-        # For production implement webhook start here
     else:
         logger.info("Starting polling...")
         app.run_polling()
